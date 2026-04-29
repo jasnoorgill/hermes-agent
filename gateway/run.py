@@ -1889,6 +1889,12 @@ class GatewayRunner:
         now = time.time()
         last_ack = self._busy_ack_ts.get(session_key, 0)
         if now - last_ack < _BUSY_ACK_COOLDOWN:
+            logger.debug(
+                "Busy-ack cooldown active for %s (%.1fs < %ss); interrupt queued without new ack",
+                session_key[:20],
+                now - last_ack,
+                _BUSY_ACK_COOLDOWN,
+            )
             return True  # interrupt sent (if not queue), ack already delivered recently
 
         self._busy_ack_ts[session_key] = now
@@ -1958,6 +1964,12 @@ class GatewayRunner:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
 
         thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+        logger.info(
+            "Busy interrupt ack: session=%s chat=%s detail=%s",
+            session_key[:20],
+            event.source.chat_id,
+            status_detail or "(none)",
+        )
         try:
             await adapter._send_with_retry(
                 chat_id=event.source.chat_id,
