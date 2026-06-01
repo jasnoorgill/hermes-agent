@@ -1,0 +1,7 @@
+name: web-tinyfish
+version: 1.0.0
+description: "TinyFish AI Web Search + Fetch + Browser — free-tier aware. Provides search, extract, and crawl via api.search.tinyfish.ai, api.fetch.tinyfish.ai, and api.browser.tinyfish.ai. Requires TINYFISH_API_KEY from agent.tinyfish.ai/api-keys."
+author: Jasnoor Gill
+kind: backend
+provides_web_providers:
+  - tinyfish
