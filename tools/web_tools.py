@@ -349,6 +349,14 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    if backend == "tinyfish":
+        # Tinyfish free search/fetch tier — gated solely on the API key env var.
+        # Tinyfish is the default web backend in this profile (see
+        # ~/.hermes/config.yaml `web.backend: tinyfish`); the check_fn used to
+        # miss this branch, hiding web_search/web_extract from the schema even
+        # though the tinyfish plugin was fully wired. Keep this in sync if a
+        # new free-tier auth path is added.
+        return _has_env("TINYFISH_API_KEY")
     return False
 
 
@@ -1074,7 +1082,6 @@ def check_web_api_key() -> bool:
             get_active_search_provider,
             get_active_extract_provider,
         )
-
         return (
             get_active_search_provider() is not None
             or get_active_extract_provider() is not None
@@ -1082,6 +1089,12 @@ def check_web_api_key() -> bool:
     except Exception as exc:  # noqa: BLE001 — registry optional; never fatal
         logger.debug("web provider registry availability check failed: %s", exc)
         return False
+
+
+def check_auxiliary_model() -> bool:
+    """Check if an auxiliary text model is available for LLM content processing."""
+    client, _, _ = _resolve_web_extract_auxiliary()
+    return client is not None
 
 
 if __name__ == "__main__":
