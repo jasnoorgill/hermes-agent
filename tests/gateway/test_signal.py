@@ -189,9 +189,8 @@ class TestSignalHelpers:
                 import os
                 os.unlink(adts_path)
             except OSError:
-                pass
+                        result = _remux_aac_to_m4a(aac_data)
 
-        result = _remux_aac_to_m4a(aac_data)
         assert result is not None
         m4a_bytes, ext = result
         assert ext == ".m4a"
