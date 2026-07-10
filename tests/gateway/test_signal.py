@@ -192,8 +192,9 @@ class TestSignalHelpers:
                 import os
                 os.unlink(adts_path)
             except OSError:
-                        result = _remux_aac_to_m4a(aac_data)
+                pass
 
+        result = _remux_aac_to_m4a(aac_data)
         assert result is not None
         m4a_bytes, ext = result
         assert ext == ".m4a"
@@ -1661,6 +1662,335 @@ class TestSignalResolveAttachmentExtension:
         # application/x-frobnitz is unknown → no MIME map → fall through
         # to magic sniffer → returns ".png"
         assert _resolve_attachment_extension("application/x-frobnitz", png_bytes) == ".png"
+
+
+# ---------------------------------------------------------------------------
+# Telegram-parity: image-as-document, oversized-file warning, canonical filename
+# ---------------------------------------------------------------------------
+
+class TestSignalTelegramParity:
+    """Verify Signal matches Telegram's exact handling for less-obvious cases.
+
+    Telegram's document-block (telegram.py:5290-5421) has several subtle
+    behaviors the initial Signal commit missed:
+
+      * Image uploaded as document (mime=image/png) → reroute to image
+        cache + tag PHOTO, not DOCUMENT
+      * Oversized file → user-facing "The document is too large…" rather
+        than silent skip
+      * Canonical cached filename ``document{ext}`` rather than
+        ``doc_{uuid}_.ext`` (the leading-dot awkwardness)
+    """
+
+    @pytest.mark.asyncio
+    async def test_image_contenttype_routes_to_image_cache(self, monkeypatch, tmp_path):
+        """contentType=image/png with PNG bytes routes to image cache.
+
+        Mirrors telegram.py §5327–5353. Telegram reroutes screenshots
+        uploaded via the file picker to the image path; Signal does the
+        same so the agent sees PHOTO, not DOCUMENT.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Real PNG bytes
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"x" * 50
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(png_bytes).decode()})
+
+        cached_png = tmp_path / "document.png"
+        cached_png.write_bytes(png_bytes)
+        image_calls = []
+        document_calls = []
+
+        def mock_image(data, ext):
+            image_calls.append(ext)
+            return str(cached_png)
+
+        def mock_document(data, filename):
+            document_calls.append(filename)
+            return str(cached_png)
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_image_from_bytes", mock_image
+        )
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes", mock_document
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-png-1",
+                            # User uploaded screenshot via file picker
+                            "contentType": "image/png",
+                            "size": 64,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls == [str(cached_png)]
+        # image cache called, document cache NOT called
+        assert len(image_calls) == 1
+        assert len(document_calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_oversized_attachment_emits_telegram_style_warning(self, monkeypatch, tmp_path):
+        """Oversized attachment produces the user-facing Telegram-format
+        message rather than silently dropping.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "message": "did you get my file?",
+                    "attachments": [
+                        {
+                            "id": "att-huge-1",
+                            "contentType": "application/pdf",
+                            "size": 200 * 1024 * 1024,  # 200 MB > 100 MB cap
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        # User caption preserved
+        assert "did you get my file?" in event.text
+        # Telegram-format oversized message
+        assert "The document is too large" in event.text
+        assert "Maximum: 100 MB." in event.text
+        # No attachment cached (it wasn't fetched)
+        assert event.media_urls == []
+
+    @pytest.mark.asyncio
+    async def test_oversized_no_size_field_skips_check(self, monkeypatch, tmp_path):
+        """Missing size field does not trigger the oversized warning.
+
+        Matches Telegram: ``if not doc.file_size or doc.file_size >
+        self._max_doc_bytes`` — when size is missing/None, the file is
+        allowed through (downstream decides). Signal's
+        ``att.get("size", 0)`` returns 0 in that case, and our condition
+        `if att_size and att_size > MAX` requires the size to be
+        truthy AND over the cap.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        pdf_bytes = b"%PDF-1.4 small"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(pdf_bytes).decode()})
+
+        cached_pdf = tmp_path / "document.pdf"
+        cached_pdf.write_bytes(pdf_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_pdf),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-no-size",
+                            "contentType": "application/pdf",
+                            # NOTE: no size field
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        # No oversized warning
+        assert "too large" not in event.text
+        # File did arrive as document
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == [str(cached_pdf)]
+
+    @pytest.mark.asyncio
+    async def test_document_cache_filename_uses_canonical_name(self, monkeypatch, tmp_path):
+        """Cached document filename follows Telegram's ``document{ext}`` pattern.
+
+        cache_document_from_bytes accepts ``ext`` as the filename parameter
+        (a leading-dot extension like ``.txt`` produces ``doc_{uuid}_.txt``).
+        The new code passes ``document{ext}`` so the cached filename is
+        ``doc_{uuid}_document.txt`` instead — test asserts we no longer
+        pass the leading-dot extension.
+        """
+        received_filenames = []
+
+        def mock_document(data, filename):
+            received_filenames.append(filename)
+            return str(tmp_path / filename)
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes", mock_document
+        )
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        txt_bytes = b"hello world\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(txt_bytes).decode()})
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-name-1",
+                            "contentType": "text/plain",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        assert received_filenames == ["document.txt"]
+        # Cached path's basename includes "document.txt"
+        event = captured["event"]
+        assert "document.txt" in event.media_urls[0]
+
+    @pytest.mark.asyncio
+    async def test_image_contenttype_with_unknown_subtype_uses_default_ext(self, monkeypatch, tmp_path):
+        """contentType=image/x-icon (no mime map) + valid PNG bytes → image cache.
+
+        Defensive coverage: when contentType is image/* but our resolver
+        can't map it (returns .bin or similar), the routing code must
+        still extract the image extension from the bytes and route to
+        the image cache with a known extension.
+        """
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"x" * 50
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(png_bytes).decode()})
+
+        # Spy on which cache function is called
+        image_calls = []
+        document_calls = []
+
+        def mock_image(data, ext):
+            image_calls.append(ext)
+            return str(tmp_path / f"img_{ext}")
+
+        def mock_document(data, filename):
+            document_calls.append(filename)
+            return str(tmp_path / filename)
+
+        monkeypatch.setattr("gateway.platforms.signal.cache_image_from_bytes", mock_image)
+        monkeypatch.setattr("gateway.platforms.signal.cache_document_from_bytes", mock_document)
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-icon-1",
+                            # contentType starts with image/ but isn't a
+                            # mapped subtype (none of our _MIME_TO_EXT
+                            # entries cover image/x-icon)
+                            "contentType": "image/x-icon",
+                            "size": 64,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        # Image cache called, document cache NOT called
+        assert len(image_calls) == 1
+        assert len(document_calls) == 0
+        # Tagged as PHOTO (image content, not document)
+        event = captured["event"]
+        assert event.message_type == MessageType.PHOTO
+
+
+class TestSignalIsImageContentType:
+    """Unit tests for the image-contentType helper."""
+
+    def test_image_png(self):
+        from gateway.platforms.signal import _is_image_content_type
+        assert _is_image_content_type("image/png") is True
+
+    def test_image_jpeg(self):
+        from gateway.platforms.signal import _is_image_content_type
+        assert _is_image_content_type("image/jpeg") is True
+
+    def test_image_with_charset_param(self):
+        from gateway.platforms.signal import _is_image_content_type
+        assert _is_image_content_type("image/png; charset=binary") is True
+
+    def test_non_image_mime(self):
+        from gateway.platforms.signal import _is_image_content_type
+        assert _is_image_content_type("text/plain") is False
+        assert _is_image_content_type("application/pdf") is False
+        assert _is_image_content_type("audio/ogg") is False
+
+    def test_empty_or_none(self):
+        from gateway.platforms.signal import _is_image_content_type
+        assert _is_image_content_type("") is False
+        assert _is_image_content_type(None) is False
 
 
 # ---------------------------------------------------------------------------

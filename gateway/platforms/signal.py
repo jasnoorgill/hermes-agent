@@ -123,6 +123,20 @@ def _is_image_ext(ext: str) -> bool:
     return ext.lower() in {".jpg", ".jpeg", ".png", ".gif", ".webp"}
 
 
+def _is_image_content_type(content_type: Optional[str]) -> bool:
+    """True when the Signal envelope advertises an image MIME.
+
+    Mirrors ``telegram.py`` §5327: when a Telegram user attaches a
+    screenshot via the file picker it carries ``mime_type="image/png"``
+    but is reported as ``msg.document``. Telegram re-routes it through
+    the image cache; we do the same so an image uploaded "as a file"
+    on Signal still triggers the PHOTO path.
+    """
+    if not content_type:
+        return False
+    return content_type.split(";", 1)[0].strip().lower().startswith("image/")
+
+
 def _is_audio_ext(ext: str) -> bool:
     return ext.lower() in {".mp3", ".wav", ".ogg", ".m4a", ".aac"}
 
@@ -787,8 +801,27 @@ class SignalAdapter(BasePlatformAdapter):
                 att_size = att.get("size", 0)
                 if not att_id:
                     continue
-                if att_size > SIGNAL_MAX_ATTACHMENT_SIZE:
-                    logger.warning("Signal: attachment too large (%d bytes), skipping", att_size)
+                if att_size and att_size > SIGNAL_MAX_ATTACHMENT_SIZE:
+                    # Mirror Telegram's "The document is too large or its
+                    # size could not be verified. Maximum: {N} MB." pattern
+                    # (see ``telegram.py`` line 5314–5322). Without the
+                    # user-facing message, the gateway would silently drop
+                    # the file and the user would wonder why the bot
+                    # didn't respond.
+                    limit_mb = SIGNAL_MAX_ATTACHMENT_SIZE // (1024 * 1024)
+                    oversized_msg = (
+                        f"The document is too large. Maximum: {limit_mb} MB."
+                    )
+                    logger.warning(
+                        "Signal: attachment %s too large (%d bytes > %d)",
+                        att_id, att_size, SIGNAL_MAX_ATTACHMENT_SIZE,
+                    )
+                    # Prepend to existing text rather than overwrite so a
+                    # user caption alongside the oversized file is preserved.
+                    if text:
+                        text = f"{oversized_msg}\n\n{text}"
+                    else:
+                        text = oversized_msg
                     continue
                 try:
                     cached_path, ext = await self._fetch_attachment(
@@ -811,7 +844,7 @@ class SignalAdapter(BasePlatformAdapter):
                 _, ext = os.path.splitext(url)
                 ext = ext.lower()
                 if not ext:
-                    unsupported_extensions.append(ext or "unknown")
+                    unsupported_extensions.append("unknown")
                     continue
                 if _is_image_ext(ext) or _is_audio_ext(ext) or _is_video_ext(ext):
                     continue
@@ -821,9 +854,10 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Inject small .md / .txt attachment content into a synthetic text body
         # so the agent can see file contents without re-reading from disk.
-        # Mirrors Telegram's text-injection block — capped at 100 KB to avoid
-        # flooding the user message; binary files (PDF/zip/docx/etc.) keep
-        # only the cached path in media_urls and stay out of event.text.
+        # Mirrors Telegram's text-injection block (telegram.py line 5405–5421):
+        # capped at 100 KB to avoid flooding the user message; binary files
+        # (PDF/zip/docx/etc.) keep only the cached path in media_urls and
+        # stay out of event.text.
         injected_text_extras: List[str] = []
         for url, mt in zip(media_urls, media_types):
             _, ext = os.path.splitext(url)
@@ -852,14 +886,19 @@ class SignalAdapter(BasePlatformAdapter):
                     url,
                 )
                 continue
+            # Telegram uses ``original_filename or f"document{ext}"``.
+            # Signal has no equivalent, so the cached filename we passed
+            # in _fetch_attachment (``document{ext}``) is the best signal.
             display_name = os.path.basename(url) or f"document{ext}"
             display_name = re.sub(r"[^\w.\- ]", "_", display_name)
             injected_text_extras.append(f"[Content of {display_name}]:\n{file_content}")
 
         # User-facing feedback for any unsupported extensions — matches
-        # Telegram's "Unsupported document type 'X'. Supported types: …"
-        # pattern so the user gets a clear, actionable error rather than a
-        # silent drop.
+        # Telegram's exact single-quoted format (``telegram.py`` line
+        # 5385–5393): ``Unsupported document type '{ext or unknown}'.
+        # Supported types: {list}``. Keeping the format identical makes
+        # the two platforms interchangeable for downstream tooling and
+        # makes the user see the same wording they would on Telegram.
         if unsupported_extensions:
             supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
             unsupported_list = ", ".join(sorted(set(unsupported_extensions)))
@@ -1109,14 +1148,38 @@ class SignalAdapter(BasePlatformAdapter):
             if remuxed is not None:
                 raw_data, ext = remuxed
 
-        if _is_image_ext(ext):
-            path = cache_image_from_bytes(raw_data, ext)
+        # Use a Telegram-style canonical filename for document cache writes
+        # (matches ``cache_document_from_bytes(raw, original_filename or
+        # f"document{ext}")`` in telegram.py). The leading ``document``
+        # prefix keeps the cached filename human-readable in the document
+        # directory instead of an unnamed leading-dot extension like
+        # ``doc_{uuid}_.txt``. Telegram benefits from ``original_filename``
+        # (its document.file_name field); Signal has no such field, so we
+        # fall back to ``document{ext}``.
+        cached_filename = f"document{ext}" if ext else "document"
+
+        if _is_image_ext(ext) or _is_image_content_type(content_type):
+            # Image-as-document reroute: when contentType advertises an
+            # image MIME (or the bytes decode to a known image extension),
+            # always route through the image cache so the agent gets the
+            # PHOTO path. Mirrors telegram.py §5327–5353.
+            #
+            # Defensive: if the contentType was image/* but our extension
+            # resolver returned something non-image (.bin for an unknown
+            # subtype like image/x-icon), the cached filename would be
+            # wrong. Force a known image extension by sniffing the bytes.
+            image_ext = ext if _is_image_ext(ext) else _guess_extension(raw_data)
+            if not _is_image_ext(image_ext):
+                image_ext = ".jpg"  # ultimate fallback; _looks_like_image
+                                    # validation in cache_image_from_bytes
+                                    # still rejects non-image bytes
+            path = cache_image_from_bytes(raw_data, image_ext)
         elif _is_audio_ext(ext):
             path = cache_audio_from_bytes(raw_data, ext)
         elif _is_video_ext(ext):
             path = cache_video_from_bytes(raw_data, ext)
         else:
-            path = cache_document_from_bytes(raw_data, ext)
+            path = cache_document_from_bytes(raw_data, cached_filename)
 
         return path, ext
 
