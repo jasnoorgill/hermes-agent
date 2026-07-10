@@ -1280,6 +1280,390 @@ class TestSignalStopTypingExplicitRPC:
         assert "+155****0000" not in adapter._typing_skip_until
 
 # ---------------------------------------------------------------------------
+# contentType-based attachment classification (.txt/.sh/.json rescue from .bin)
+# ---------------------------------------------------------------------------
+
+class TestSignalTextFileClassification:
+    """Verify text-only attachments land at the right extension, not .bin.
+
+    Root cause: ``_guess_extension`` only knew magic-byte signatures for
+    images/audio/video/PDF/zip. A .txt / .sh / .md / .json / .csv /
+    .py / .ts / .yaml payload has no matching magic prefix, so it fell
+    through to ``return ".bin"`` — then hit the unsupported-extension
+    reject even though the Signal envelope already advertised it as
+    ``text/plain`` or ``application/json``.
+
+    Fix: ``_resolve_attachment_extension`` prefers ``contentType`` from
+    the Signal envelope and falls back to magic-byte / UTF-8 sniff only
+    when contentType is missing or the catch-all
+    ``application/octet-stream``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_text_plain_payload_rescued_from_bin(self, monkeypatch, tmp_path):
+        """Reproducer from the live bug: text/plain shell-script payload.
+
+        Bytes start with ``#!/usr/bin/env bash``. Without contentType
+        rescue, the magic sniffer returns ".bin" because nothing in
+        those first bytes matches any known signature. With rescue, the
+        envelope's ``text/plain`` → ``.txt`` mapping takes priority.
+        """
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Real shell-script payload — exactly what the user uploaded.
+        shell_payload = b"#!/usr/bin/env bash\necho hello\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(shell_payload).decode()})
+
+        cached_txt = tmp_path / "doc_aaaaaaaaaaaa_.txt"
+        cached_txt.write_bytes(shell_payload)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_txt),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-shell-1",
+                            # The key fix: Signal envelope advertises this
+                            # as text/plain even when .bin sniffing fails.
+                            "contentType": "text/plain",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # No "Unsupported document" feedback — extension is .txt, which
+        # is in SUPPORTED_DOCUMENT_TYPES.
+        assert "Unsupported document type" not in event.text
+        # Text-injection pulls the script contents into event.text.
+        assert "[Content of" in event.text
+        assert "#!/usr/bin/env bash" in event.text
+        assert "echo hello" in event.text
+        assert event.media_urls[0].endswith(".txt")
+
+    @pytest.mark.asyncio
+    async def test_shellscript_contenttype_maps_to_sh(self, monkeypatch, tmp_path):
+        """text/x-shellscript contentType maps to .sh — not .bin.
+
+        .sh IS in SUPPORTED_DOCUMENT_TYPES so this is a fully-supported
+        doc (no error feedback, just cached path with extension). The
+        test's role here is to assert the extension is rescued from .bin
+        so downstream tools know what kind of file it is.
+        """
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        shell_bytes = b"#!/bin/sh\nexit 0\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(shell_bytes).decode()})
+
+        cached_sh = tmp_path / "doc_bbbbbbbbbbbb_.sh"
+        cached_sh.write_bytes(shell_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_sh),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-sh-1",
+                            "contentType": "text/x-shellscript",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # Cached path's extension is .sh (rescued from .bin)
+        assert event.media_urls[0].endswith(".sh")
+        # No unsupported-feedback (because .sh IS in SUPPORTED_DOCUMENT_TYPES)
+        assert "Unsupported document type" not in event.text
+        # The mime type follows the envelope's contentType
+        assert event.media_types == ["text/x-shellscript"]
+
+
+    @pytest.mark.asyncio
+    async def test_unknown_extension_still_returns_feedback(self, monkeypatch, tmp_path):
+        """Sanity: extensions truly outside the allowlist still get feedback.
+
+        Regression counterpart to the .txt rescue. .exe is not in
+        SUPPORTED_DOCUMENT_TYPES and there's no MIME map for it, so the
+        old "Unsupported" feedback must still fire.
+        """
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        exe_bytes = b"MZ\x90\x00 fake"  # Random binary blob
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(exe_bytes).decode()})
+
+        cached_exe = tmp_path / "doc_dddddddddddd_.exe"
+        cached_exe.write_bytes(exe_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_exe),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-exe-x",
+                            "contentType": "application/x-msdownload",
+                            "size": 64,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls[0].endswith(".exe")
+        # The feedback IS produced because .exe is genuinely unsupported.
+        assert "Unsupported document type" in event.text
+        assert ".exe" in event.text
+
+    @pytest.mark.asyncio
+    async def test_json_payload_classified_via_contenttype(self, monkeypatch, tmp_path):
+        """application/json text payload lands as .json."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        json_bytes = b'{"hello":"world","key":"value"}'
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(json_bytes).decode()})
+
+        cached_json = tmp_path / "doc_cccccccccccc_.json"
+        cached_json.write_bytes(json_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_json),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-json-1",
+                            "contentType": "application/json",
+                            "size": 64,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # Cached path ends in .json (not .bin)
+        assert event.media_urls[0].endswith(".json")
+        assert ".bin" not in event.text
+
+    @pytest.mark.asyncio
+    async def test_no_contenttype_uses_utf8_sniff(self, monkeypatch, tmp_path):
+        """Envelope's contentType missing + magic sniffer says .bin
+        → UTF-8 sniff rescues as .txt.
+        """
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        text_bytes = b"some plain text notes\nwith two lines\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(text_bytes).decode()})
+
+        cached_txt = tmp_path / "doc_dddddddddddd_.txt"
+        cached_txt.write_bytes(text_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_txt),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-noct-1",
+                            # No contentType at all. Trickiest case.
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # UTF-8 sniff gave us .txt when there are no other clues
+        assert event.media_urls[0].endswith(".txt")
+        assert "Unsupported document type" not in event.text
+
+    @pytest.mark.asyncio
+    async def test_octet_stream_falls_back_to_magic_then_utf8(self, monkeypatch, tmp_path):
+        """Catch-all ``application/octet-stream`` falls through to magic + UTF-8.
+
+        Some Signal clients (notably desktop) report every attachment
+        as ``application/octet-stream`` regardless of actual content.
+        The helper should fall through to magic-byte + UTF-8 sniff in
+        that case.
+        """
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        text_bytes = b"text contents for octet-stream test\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(text_bytes).decode()})
+
+        cached = tmp_path / "doc_eeeeeeeeeeee_.txt"
+        cached.write_bytes(text_bytes)
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-oct-1",
+                            "contentType": "application/octet-stream",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # contentType isn't mappable, magic says .bin, UTF-8 sniff rescues → .txt
+        assert event.media_urls[0].endswith(".txt")
+        assert "Unsupported document type" not in event.text
+
+
+class TestSignalResolveAttachmentExtension:
+    """Unit tests for the resolver helper itself — no Signal adapter."""
+
+    def test_contenttype_priority_over_magic_bytes(self):
+        """text/plain wins over magic bytes for a PNG payload."""
+        from gateway.platforms.signal import _resolve_attachment_extension
+        # PNG-magic bytes + envelope saying text/plain → envelope wins
+        png_magic = b"\x89PNG\r\n\x1a\n" + b"x" * 50
+        assert _resolve_attachment_extension("text/plain", png_magic) == ".txt"
+
+    def test_octet_stream_with_utf8_text_becomes_txt(self):
+        """Live-bug reproducer across all 4 contentType variants."""
+        from gateway.platforms.signal import _resolve_attachment_extension
+        shell_payload = b"#!/usr/bin/env bash\necho hello\n"
+        # No contentType
+        assert _resolve_attachment_extension(None, shell_payload) == ".txt"
+        # Catch-all contentType
+        assert _resolve_attachment_extension("application/octet-stream", shell_payload) == ".txt"
+        # Correct contentType
+        assert _resolve_attachment_extension("text/plain", shell_payload) == ".txt"
+        # Shell MIME maps to .sh
+        assert _resolve_attachment_extension("text/x-shellscript", shell_payload) == ".sh"
+
+    def test_real_binary_payload_stays_bin(self):
+        """Non-UTF-8 binary payload must NOT be reclassified as text."""
+        from gateway.platforms.signal import _resolve_attachment_extension
+        binary = bytes(range(0, 256)) * 4  # Fails UTF-8 decode
+        assert _resolve_attachment_extension(None, binary) == ".bin"
+
+    def test_mime_parameters_are_stripped(self):
+        """MIME params like ``; charset=utf-8`` must not break lookup."""
+        from gateway.platforms.signal import _resolve_attachment_extension
+        assert _resolve_attachment_extension("text/plain; charset=utf-8", b"hi\n") == ".txt"
+
+    def test_unknown_mime_with_magic_byte_uses_magic(self):
+        """Unknown MIME → trust the magic byte sniff if it has something."""
+        from gateway.platforms.signal import _resolve_attachment_extension
+        png_bytes = b"\x89PNG\r\n\x1a\n" + b"x" * 50
+        # application/x-frobnitz is unknown → no MIME map → fall through
+        # to magic sniffer → returns ".png"
+        assert _resolve_attachment_extension("application/x-frobnitz", png_bytes) == ".png"
+
+
+# ---------------------------------------------------------------------------
 # Reply quote extraction
 # ---------------------------------------------------------------------------
 

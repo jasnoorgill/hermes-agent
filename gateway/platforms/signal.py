@@ -144,6 +144,102 @@ def _ext_to_mime(ext: str) -> str:
     return mime_for_ext(ext, fallback="application/octet-stream")
 
 
+# Reverse of _EXT_TO_MIME — also covers textual/document types that the
+# magic-byte sniffer cannot identify. Used as a rescue lookup when the
+# Signal envelope carries a `contentType` that _guess_extension cannot
+# recover from raw bytes (e.g. plain text, JSON, shell scripts).
+_MIME_TO_EXT = {
+    # Documents — supplements SUPPORTED_DOCUMENT_TYPES (which is the
+    # allowlist, not the resolver). Keep both in sync when adding doc types.
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "application/json": ".json",
+    "application/xml": ".xml",
+    "application/yaml": ".yaml",
+    "application/toml": ".toml",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    # Text — most common regression source. Magic-byte sniffer falls
+    # through to ".bin" for any non-trivial text payload because nothing
+    # in the byte prefix matches the existing image/audio/video/document
+    # signatures.
+    "text/plain": ".txt",
+    "text/markdown": ".md",
+    "text/csv": ".csv",
+    "text/html": ".html",
+    "text/xml": ".xml",
+    "text/x-shellscript": ".sh",
+    "text/x-python": ".py",
+    "text/x-typescript": ".ts",
+    # Images
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    # Audio
+    "audio/ogg": ".ogg",
+    "audio/mpeg": ".mp3",
+    "audio/wav": ".wav",
+    "audio/mp4": ".m4a",
+    "audio/aac": ".aac",
+    "audio/opus": ".ogg",
+    # Video
+    "video/mp4": ".mp4",
+    "video/quicktime": ".mov",
+    "video/webm": ".webm",
+    "video/x-matroska": ".mkv",
+    "video/x-msvideo": ".avi",
+}
+
+
+def _mime_to_ext(mime: str) -> Optional[str]:
+    """Reverse-lookup from MIME to canonical extension. Returns None on miss."""
+    if not mime:
+        return None
+    primary = mime.split(";", 1)[0].strip().lower()
+    return _MIME_TO_EXT.get(primary)
+
+
+def _resolve_attachment_extension(content_type: Optional[str], data: bytes) -> str:
+    """Resolve an attachment's extension from envelope + magic bytes.
+
+    Order of preference:
+      1. ``content_type`` from the Signal envelope (e.g. ``"text/plain"``,
+         ``"application/pdf"``). Trusted because the sender's Signal
+         client already classified the payload by filename/MIME.
+      2. ``_guess_extension`` magic-byte sniff as a fallback for when the
+         envelope carries the catch-all ``"application/octet-stream"``
+         (some Signal clients do this for unrecognised types).
+      3. ``".bin"`` only when both signals are absent or uninformative.
+
+    Without this rescue, every text-only document (.txt, .md, .sh, .py,
+    .json, .csv, ...) falls through the magic sniffer to ".bin" and
+    lands in the "Unsupported document type" branch — even though the
+    envelope already told us what it was.
+    """
+    if content_type:
+        ext = _mime_to_ext(content_type)
+        if ext:
+            return ext
+    guessed = _guess_extension(data)
+    if guessed != ".bin":
+        return guessed
+    # Last-resort: sniff for plain UTF-8 text. Most non-binary text files
+    # (shell scripts, JSON, YAML, code) decode as UTF-8 with no errors;
+    # binaries almost always do not. This rescues the common case where
+    # both the envelope's contentType AND the magic-byte sniffer said
+    # "no idea, .bin" but the bytes are clearly a text file.
+    try:
+        data.decode("utf-8")
+    except (UnicodeDecodeError, AttributeError):
+        return ".bin"
+    # No way to know which text extension without more clues. Default to
+    # .txt because it's the most common. The content will still be
+    # injected into event.text for the agent to read either way.
+    return ".txt"
+
+
 def _remux_aac_to_m4a(aac_data: bytes) -> Optional[Tuple[bytes, str]]:
     """Losslessly remux raw ADTS AAC bytes into an MP4 (.m4a) container.
 
@@ -695,7 +791,9 @@ class SignalAdapter(BasePlatformAdapter):
                     logger.warning("Signal: attachment too large (%d bytes), skipping", att_size)
                     continue
                 try:
-                    cached_path, ext = await self._fetch_attachment(att_id)
+                    cached_path, ext = await self._fetch_attachment(
+                        att_id, content_type=att.get("contentType")
+                    )
                     if not cached_path:
                         continue
                     # Use contentType from Signal if available, else map from extension
@@ -969,8 +1067,17 @@ class SignalAdapter(BasePlatformAdapter):
     # Attachment Handling
     # ------------------------------------------------------------------
 
-    async def _fetch_attachment(self, attachment_id: str) -> tuple:
-        """Fetch an attachment via JSON-RPC and cache it. Returns (path, ext)."""
+    async def _fetch_attachment(
+        self, attachment_id: str, content_type: Optional[str] = None
+    ) -> tuple:
+        """Fetch an attachment via JSON-RPC and cache it. Returns (path, ext).
+
+        ``content_type`` is the MIME the Signal envelope advertised for
+        this attachment (e.g. ``"text/plain"``). Passed to
+        ``_resolve_attachment_extension`` so textual/document types that
+        have no magic-byte signature can still be classified correctly
+        instead of falling through to ``.bin``.
+        """
         result = await self._rpc("getAttachment", {
             "account": self.account,
             "id": attachment_id,
@@ -988,7 +1095,7 @@ class SignalAdapter(BasePlatformAdapter):
 
         # Result is base64-encoded file content
         raw_data = base64.b64decode(result)
-        ext = _guess_extension(raw_data)
+        ext = _resolve_attachment_extension(content_type, raw_data)
 
         # Android Signal voice notes are raw ADTS AAC streams. Most STT
         # providers (Groq Whisper, OpenAI Whisper) reject raw ADTS — they
