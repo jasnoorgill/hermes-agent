@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import random
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,10 +38,13 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    SUPPORTED_DOCUMENT_TYPES,
+    SUPPORTED_VIDEO_TYPES,
     cache_image_from_bytes,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    cache_video_from_bytes,
 )
 from gateway.platforms.helpers import redact_phone
 from gateway.platforms.media_cache import DEFAULT_EXT_TO_MIME, mime_for_ext
@@ -121,6 +125,10 @@ def _is_image_ext(ext: str) -> bool:
 
 def _is_audio_ext(ext: str) -> bool:
     return ext.lower() in {".mp3", ".wav", ".ogg", ".m4a", ".aac"}
+
+
+def _is_video_ext(ext: str) -> bool:
+    return ext.lower() in set(SUPPORTED_VIDEO_TYPES)
 
 
 # Historical Signal ext→mime table now lives in
@@ -669,9 +677,13 @@ class SignalAdapter(BasePlatformAdapter):
         reply_to_is_own = self._quote_references_own_message(reply_to_id, reply_to_author)
 
         # Process attachments
+        # Mirror Telegram/WhatsApp/Slack/BlueBubbles pattern:
+        # tag audio=VOICE, image=PHOTO, video=VIDEO, anything else in
+        # SUPPORTED_DOCUMENT_TYPES=DOCUMENT, anything else→user feedback.
         attachments_data = data_message.get("attachments", [])
         media_urls = []
         media_types = []
+        unsupported_extensions: List[str] = []
 
         if attachments_data and not getattr(self, "ignore_attachments", False):
             for att in attachments_data:
@@ -684,13 +696,90 @@ class SignalAdapter(BasePlatformAdapter):
                     continue
                 try:
                     cached_path, ext = await self._fetch_attachment(att_id)
-                    if cached_path:
-                        # Use contentType from Signal if available, else map from extension
-                        content_type = att.get("contentType") or _ext_to_mime(ext)
-                        media_urls.append(cached_path)
-                        media_types.append(content_type)
+                    if not cached_path:
+                        continue
+                    # Use contentType from Signal if available, else map from extension
+                    content_type = att.get("contentType") or _ext_to_mime(ext)
+                    media_urls.append(cached_path)
+                    media_types.append(content_type)
                 except Exception:
                     logger.exception("Signal: failed to fetch attachment %s", att_id)
+
+            # Validate each attachment's extension maps to a category we know
+            # how to handle. Anything outside the Telegram-style allowlist
+            # (images / audio / SUPPORTED_VIDEO_TYPES / SUPPORTED_DOCUMENT_TYPES)
+            # gets tagged for user feedback rather than silently mis-cached.
+            for url, mt in zip(media_urls, media_types):
+                _, ext = os.path.splitext(url)
+                ext = ext.lower()
+                if not ext:
+                    unsupported_extensions.append(ext or "unknown")
+                    continue
+                if _is_image_ext(ext) or _is_audio_ext(ext) or _is_video_ext(ext):
+                    continue
+                if ext in SUPPORTED_DOCUMENT_TYPES:
+                    continue
+                unsupported_extensions.append(ext)
+
+        # Inject small .md / .txt attachment content into a synthetic text body
+        # so the agent can see file contents without re-reading from disk.
+        # Mirrors Telegram's text-injection block — capped at 100 KB to avoid
+        # flooding the user message; binary files (PDF/zip/docx/etc.) keep
+        # only the cached path in media_urls and stay out of event.text.
+        injected_text_extras: List[str] = []
+        for url, mt in zip(media_urls, media_types):
+            _, ext = os.path.splitext(url)
+            ext = ext.lower()
+            if ext not in {".md", ".txt"}:
+                continue
+            try:
+                size = os.path.getsize(url)
+            except OSError:
+                continue
+            MAX_TEXT_INJECT_BYTES = 100 * 1024
+            if size > MAX_TEXT_INJECT_BYTES:
+                logger.debug(
+                    "Signal: %s is %d bytes, exceeding 100 KB text-injection cap — not injecting",
+                    url, size,
+                )
+                continue
+            try:
+                with open(url, "r", encoding="utf-8") as f:
+                    file_content = f.read()
+            except (OSError, UnicodeDecodeError):
+                # Binary bytes inside a .txt extension, or file vanished — skip
+                # content injection; the cached file is still in media_urls.
+                logger.debug(
+                    "Signal: could not read %s as UTF-8, skipping text injection",
+                    url,
+                )
+                continue
+            display_name = os.path.basename(url) or f"document{ext}"
+            display_name = re.sub(r"[^\w.\- ]", "_", display_name)
+            injected_text_extras.append(f"[Content of {display_name}]:\n{file_content}")
+
+        # User-facing feedback for any unsupported extensions — matches
+        # Telegram's "Unsupported document type 'X'. Supported types: …"
+        # pattern so the user gets a clear, actionable error rather than a
+        # silent drop.
+        if unsupported_extensions:
+            supported_list = ", ".join(sorted(SUPPORTED_DOCUMENT_TYPES.keys()))
+            unsupported_list = ", ".join(sorted(set(unsupported_extensions)))
+            unsupported_msg = (
+                f"Unsupported document type(s): {unsupported_list}. "
+                f"Supported types: {supported_list}"
+            )
+            if text:
+                text = f"{unsupported_msg}\n\n{text}" if text else unsupported_msg
+            else:
+                text = unsupported_msg
+
+        # Concatenate any injected text-file contents. Order: feedback first,
+        # then injected content, then user caption — user caption last so it
+        # remains the most recent/natural stop of the message.
+        if injected_text_extras:
+            injected_blob = "\n\n".join(injected_text_extras)
+            text = f"{injected_blob}\n\n{text}" if text else injected_blob
 
         # Skip envelopes with no meaningful content (no text, no attachments).
         # Catches profile key updates, empty messages, and other metadata-only
@@ -716,19 +805,19 @@ class SignalAdapter(BasePlatformAdapter):
         )
 
         # Determine message type from media
+        # Mirror Slack/BlueBubbles/WhatsApp/Telegram: every attachment that
+        # isn't an image, audio, or video is a DOCUMENT by default. Without
+        # this fallback, a PDF/zip arriving on Signal was tagged as TEXT,
+        # which then got filtered out as a contentless envelope.
         msg_type = MessageType.TEXT
         if media_types:
-            if any(mt.startswith("audio/") for mt in media_types):
+            if any(_is_audio_ext(os.path.splitext(url)[1].lower()) or mt.startswith("audio/") for url, mt in zip(media_urls, media_types)):
                 msg_type = MessageType.VOICE
-            elif any(mt.startswith("image/") for mt in media_types):
+            elif any(_is_image_ext(os.path.splitext(url)[1].lower()) or mt.startswith("image/") for url, mt in zip(media_urls, media_types)):
                 msg_type = MessageType.PHOTO
-            elif any(mt.startswith("video/") for mt in media_types):
+            elif any(_is_video_ext(os.path.splitext(url)[1].lower()) or mt.startswith("video/") for url, mt in zip(media_urls, media_types)):
                 msg_type = MessageType.VIDEO
             else:
-                # Catch-all: application/*, text/*, and unknown MIME types are
-                # treated as documents so run.py's document-context injection
-                # surfaces the cached file path to the agent (same pattern as
-                # WhatsApp/Slack/BlueBubbles/Mattermost).
                 msg_type = MessageType.DOCUMENT
 
         # Parse timestamp from envelope data (milliseconds since epoch)
@@ -917,6 +1006,8 @@ class SignalAdapter(BasePlatformAdapter):
             path = cache_image_from_bytes(raw_data, ext)
         elif _is_audio_ext(ext):
             path = cache_audio_from_bytes(raw_data, ext)
+        elif _is_video_ext(ext):
+            path = cache_video_from_bytes(raw_data, ext)
         else:
             path = cache_document_from_bytes(raw_data, ext)
 

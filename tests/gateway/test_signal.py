@@ -1,12 +1,15 @@
 """Tests for Signal messenger platform adapter."""
 import asyncio
 import base64
+import json
+import os
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, AsyncMock
 from urllib.parse import quote
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.base import MessageType, MessageEvent
 
 
 @pytest.fixture(autouse=True)
@@ -791,6 +794,422 @@ class TestSignalTypingBackoff:
 
 
 # ---------------------------------------------------------------------------
+# Document attachment classification (PDF/zip/docx/etc.) + text injection
+# ---------------------------------------------------------------------------
+
+class TestSignalDocumentAttachments:
+    """Verify Signal non-media attachments are routed like Telegram/WhatsApp.
+
+    Mirrors the Telegram pattern at ``telegram.py`` line 5395–5421 and the
+    Slack/BlueBubbles/WhatsApp ``MessageType.DOCUMENT`` fallback. Without
+    this, a Signal-sent PDF/zip arrives as ``MessageType.TEXT`` and is
+    dropped at the "no meaningful content" envelope gate.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pdf_attachment_tagged_as_document(self, monkeypatch, tmp_path):
+        import base64
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment to return real PDF bytes
+        pdf_bytes = b"%PDF-1.4 sample"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(pdf_bytes).decode()})
+
+        # Simulate cached PDF inside the document cache dir
+        cached_pdf = tmp_path / "doc_test_report.pdf"
+        cached_pdf.write_bytes(b"%PDF-1.4 sample")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_pdf),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-pdf-1",
+                            "contentType": "application/pdf",
+                            "size": 1024,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == [str(cached_pdf)]
+        assert event.media_types == ["application/pdf"]
+        assert os.path.exists(event.media_urls[0])
+
+    @pytest.mark.asyncio
+    async def test_zip_attachment_tagged_as_document(self, monkeypatch, tmp_path):
+        import base64
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment to return real ZIP bytes
+        zip_bytes = b"PK\x03\x04 fake"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(zip_bytes).decode()})
+
+        cached_zip = tmp_path / "doc_test_archive.zip"
+        cached_zip.write_bytes(b"PK\x03\x04 fake")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_zip),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-zip-1",
+                            "contentType": "application/zip",
+                            "size": 4096,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == [str(cached_zip)]
+        assert event.media_types == ["application/zip"]
+
+    @pytest.mark.asyncio
+    async def test_md_attachment_injects_content_into_text(self, monkeypatch, tmp_path):
+        """Small .md files get their content inlined into event.text."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment with real markdown bytes
+        md_bytes = b"# Heading\n\nHello world\n"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(md_bytes).decode()})
+
+        cached_md = tmp_path / "doc_test_notes.md"
+        cached_md.write_text("# Heading\n\nHello world\n", encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_md),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-md-1",
+                            "contentType": "text/markdown",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert "[Content of" in event.text
+        assert "notes.md" in event.text
+        assert "# Heading" in event.text
+        assert "Hello world" in event.text
+        assert event.media_urls == [str(cached_md)]
+
+
+    @pytest.mark.asyncio
+    async def test_txt_attachment_injects_content_with_caption(self, monkeypatch, tmp_path):
+        """Text injection preserves user caption and preserves attachment path."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment with real text bytes
+        txt_bytes = b"please summarize this file"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(txt_bytes).decode()})
+
+        cached_txt = tmp_path / "doc_test_notes.txt"
+        cached_txt.write_text("please summarize this file", encoding="utf-8")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_txt),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "message": "summarize this please",
+                    "attachments": [
+                        {
+                            "id": "att-txt-1",
+                            "contentType": "text/plain",
+                            "size": 32,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        # Both injected content and user caption present
+        assert "please summarize this file" in event.text
+        assert "summarize this please" in event.text
+        assert "[Content of" in event.text
+        assert "notes.txt" in event.text
+        # User caption appears AFTER injected content (caption is the natural stop)
+        assert event.text.index("summarize this please") > event.text.index(
+            "[Content of"
+        )
+        assert event.media_urls == [str(cached_txt)]
+
+
+    @pytest.mark.asyncio
+    async def test_large_text_file_skips_injection(self, monkeypatch, tmp_path):
+        """Files over 100 KB keep their cached path but don't bloat event.text."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment — content doesn't matter (won't be read),
+        # but we need the in-memory size check on cache path to trigger.
+        big_bytes = b"x" * (200 * 1024)
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(big_bytes).decode()})
+
+        # Build a real >100 KB file so os.path.getsize sees the right size
+        big_path = tmp_path / "big.md"
+        big_path.write_bytes(b"x" * (200 * 1024))
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(big_path),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-big-md",
+                            "contentType": "text/markdown",
+                            "size": 200 * 1024,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == [str(big_path)]
+        # Injected-content marker must NOT appear (cap-protected)
+        assert "[Content of" not in event.text
+
+    @pytest.mark.asyncio
+    async def test_video_attachment_tagged_as_video(self, monkeypatch, tmp_path):
+        """mp4 attachments route through cache_video_from_bytes + MessageType.VIDEO."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment with ftyp-magic mp4 bytes
+        mp4_bytes = b"\x00\x00\x00\x18ftypmp42"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(mp4_bytes).decode()})
+
+        cached_mp4 = tmp_path / "vid_clip.mp4"
+        cached_mp4.write_bytes(b"\x00\x00\x00\x18ftypmp42")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_video_from_bytes",
+            lambda data, ext: str(cached_mp4),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-mp4-1",
+                            "contentType": "video/mp4",
+                            "size": 5_000_000,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.VIDEO
+        assert event.media_urls == [str(cached_mp4)]
+        assert event.media_types == ["video/mp4"]
+
+    @pytest.mark.asyncio
+    async def test_unsupported_attachment_returns_feedback_text(self, monkeypatch, tmp_path):
+        """Unknown extensions land in media_urls but get user-facing feedback."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment — bytes will be sniffed as .exe-ish
+        # (no magic signature in _guess_extension that matches .exe → falls
+        # back to "" or "unknown"; either way it won't be in the allowlist).
+        exe_bytes = b"MZ\x90\x00 fake"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(exe_bytes).decode()})
+
+        # .exe extension isn't in any allowlist — would have been silently dropped
+        # before this fix. Now the user sees an actionable error.
+        cached_exe = tmp_path / "doc_test_payload.exe"
+        cached_exe.write_bytes(b"MZ\x90\x00 fake")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_exe),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "attachments": [
+                        {
+                            "id": "att-exe-1",
+                            "contentType": "application/octet-stream",
+                            "size": 4096,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert event.media_urls == [str(cached_exe)]
+        assert "Unsupported document type" in event.text
+        assert ".exe" in event.text
+        # The supported-types list must be present for the user to act on
+        assert "Supported types:" in event.text
+
+    @pytest.mark.asyncio
+    async def test_pdf_with_caption_event_text_preserves_caption(self, monkeypatch, tmp_path):
+        """A PDF with a user caption: cached path + caption preserved."""
+
+        adapter = _make_signal_adapter(monkeypatch)
+        captured = {}
+
+        async def fake_handle(event):
+            captured["event"] = event
+
+        adapter.handle_message = fake_handle
+
+        # Stub JSON-RPC getAttachment to return real PDF bytes
+        pdf_bytes = b"%PDF-1.4 sample"
+        adapter._rpc, _ = _stub_rpc({"data": base64.b64encode(pdf_bytes).decode()})
+
+        cached_pdf = tmp_path / "doc_test_q3-report.pdf"
+        cached_pdf.write_bytes(b"%PDF-1.4 sample")
+        monkeypatch.setattr(
+            "gateway.platforms.signal.cache_document_from_bytes",
+            lambda data, ext: str(cached_pdf),
+        )
+
+        envelope = {
+            "envelope": {
+                "sourceNumber": "+155****1111",
+                "sourceUuid": "uuid-sender",
+                "sourceName": "Tester",
+                "timestamp": 1700000000000,
+                "dataMessage": {
+                    "message": "can you look this over?",
+                    "attachments": [
+                        {
+                            "id": "att-pdf-2",
+                            "contentType": "application/pdf",
+                            "size": 2048,
+                        }
+                    ],
+                },
+            }
+        }
+        await adapter._handle_envelope(envelope)
+
+        event = captured["event"]
+        assert event.message_type == MessageType.DOCUMENT
+        assert "can you look this over?" in event.text
+        assert event.media_urls == [str(cached_pdf)]
+
+
 # _stop_typing_indicator sends explicit sendTyping(stop=True) RPC
 # ---------------------------------------------------------------------------
 
@@ -832,6 +1251,33 @@ class TestSignalStopTypingExplicitRPC:
         assert "+155****0000" not in adapter._typing_failures
         assert "+155****0000" not in adapter._typing_skip_until
 
+    @pytest.mark.asyncio
+    async def test_stop_typing_indicator_best_effort_on_recipient_failure(self, monkeypatch):
+        # When _resolve_recipient() raises, the per-chat backoff state must
+        # still be cleared — otherwise a transient resolution failure would
+        # silently keep the chat in cooldown forever.
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter._resolve_recipient = AsyncMock(
+            side_effect=RuntimeError("recipient resolution failed")
+        )
+
+        captured = []
+
+        async def mock_rpc(method, params, rpc_id=None, **kwargs):
+            captured.append({"method": method, "params": dict(params), "rpc_id": rpc_id})
+            return {}
+
+        adapter._rpc = mock_rpc
+
+        adapter._typing_failures["+155****0000"] = 2
+        adapter._typing_skip_until["+155****0000"] = 9999999999.0
+
+        await adapter._stop_typing_indicator("+155****0000")
+
+        # No RPC must be issued when recipient resolution itself fails.
+        assert captured == []
+        assert "+155****0000" not in adapter._typing_failures
+        assert "+155****0000" not in adapter._typing_skip_until
 
 # ---------------------------------------------------------------------------
 # Reply quote extraction
