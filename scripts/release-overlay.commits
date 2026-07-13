@@ -1,0 +1,31 @@
+# release-overlay.commits
+#
+# List the commits you want to layer on top of each upstream release tag.
+# One commit SHA, short SHA, or branch ref per line. Lines starting with '#'
+# are comments; blank lines are ignored. Order matters — cherry-picks run
+# top-to-bottom.
+#
+# Re-running for a new release (e.g. v2026.8.15):
+#   1. Add any NEW custom commits to this file (old ones still in the list
+#      are skipped automatically if they're already on the new tag's base).
+#   2. Run: scripts/release-overlay.sh v2026.8.15
+#   3. Resolve any conflicts interactively. Re-run after fixing.
+#   4. Push: git push fork release/v2026.8.15 jasnoor/v2026.8.15-custom
+#
+# --- TinyFish web backend (June 2026) ---
+# Plugin + registry wiring + schema-gate allowlist. NOT yet on any upstream
+# release tag — these are our unique value-add.
+8bea9fc6be19c1de928d78d67fea06a25aa1872a
+4ccd63edf5eb9bc094e90ea41cd91f6fc2b24919
+86a1f914d50490c3b1aa98c5820e821c067d9b87
+
+# --- Signal attachment handling ---
+# These were the canonical fixes as of July 2026. They are EQUIVALENT to the
+# implementations that landed in upstream v2026.7.7.2 (cherry-pick conflicts
+# confirmed each fix is duplicated). Re-applying them against v2026.7.7.2 or
+# later is a no-op — skip them. They are kept here for documentation only;
+# the script's "already-on-tag-base" auto-skip would skip them anyway.
+# 4069c3a464acf9cc05ed532f332a5d79211085f9
+# b8a28da53b50686fdbe38c6f4cf73153f0fccf1b
+# eec7ae8f0749c46a4a787596b2f411ffd366291e
+# 7d60da764f731009eb2ec526a2fa4a7ef23560b1
