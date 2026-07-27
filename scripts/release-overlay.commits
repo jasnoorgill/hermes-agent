@@ -5,27 +5,47 @@
 # are comments; blank lines are ignored. Order matters — cherry-picks run
 # top-to-bottom.
 #
-# Re-running for a new release (e.g. v2026.8.15):
+# Re-running for a NEW release (e.g. v2026.8.15):
 #   1. Add any NEW custom commits to this file (old ones still in the list
 #      are skipped automatically if they're already on the new tag's base).
 #   2. Run: scripts/release-overlay.sh v2026.8.15
 #   3. Resolve any conflicts interactively. Re-run after fixing.
 #   4. Push: git push fork release/v2026.8.15 jasnoor/v2026.8.15-custom
 #
-# --- TinyFish web backend (June 2026) ---
-# Plugin + registry wiring + schema-gate allowlist. NOT yet on any upstream
-# release tag — these are our unique value-add.
-8bea9fc6be19c1de928d78d67fea06a25aa1872a
-4ccd63edf5eb9bc094e90ea41cd91f6fc2b24919
-86a1f914d50490c3b1aa98c5820e821c067d9b87
+# --- TinyFish web backend (canonical prod overlay) ---
+# These 3 commits are the actual prod overlay on jasnoor/v2026.7.7.2-custom
+# (verified via `git log v2026.7.7.2..jasnoor/v2026.7.7.2-custom --oneline`).
+# Order matters: provider first, then registration, then allowlist probe.
+f4254fb27af3379b8145793600dea5e88a1b3949
+ed7eb6a34f9d7c19e2821512f3d705e78d89b548
+7589a210e85f93e5f226a150bdc5cf7209821953
 
-# --- Signal attachment handling ---
-# These were the canonical fixes as of July 2026. They are EQUIVALENT to the
-# implementations that landed in upstream v2026.7.7.2 (cherry-pick conflicts
-# confirmed each fix is duplicated). Re-applying them against v2026.7.7.2 or
-# later is a no-op — skip them. They are kept here for documentation only;
-# the script's "already-on-tag-base" auto-skip would skip them anyway.
-# 4069c3a464acf9cc05ed532f332a5d79211085f9
-# b8a28da53b50686fdbe38c6f4cf73153f0fccf1b
-# eec7ae8f0749c46a4a787596b2f411ffd366291e
-# 7d60da764f731009eb2ec526a2fa4a7ef23560b1
+# --- Tool-loop guard + busy-queue merge_text=True (NOT YET CARRIED) ---
+# 7f7e52cd12 Cherry-pick: tool-loop guard + merge_text=True on busy-queue paths
+#
+# This commit lives on the older jasnoor/v0.15.2-jasnoor-working-code branch
+# but was NOT re-cherry-picked onto jasnoor/v2026.7.7.2-custom (v0.18.2's
+# run_agent.py and gateway/run.py have moved enough that the v0.15.2-era
+# patch needs manual conflict resolution per release).
+#
+# Action: re-cherry-pick 7f7e52cd12 by hand onto each new release overlay
+# branch (outside this manifest) and resolve conflicts interactively. If
+# the v0.19.0 run_agent.py already contains the tool-loop guard, skip the
+# cherry-pick and remove this comment.
+
+# --- Signal attachment PRs (NOT IN THIS MANIFEST) ---
+# The 4 signal PRs (AAC remux, route non-media, contentType rescue, Telegram
+# parity) live on jasnoor/v0.15.2-jasnoor-working-code. They were cherry-picked
+# onto jasnoor/v2026.7.7.2-custom (commits b9df769f63, f8cf5d11df, a5a82021ba)
+# but PR 1 (AAC remux) was a no-op against v0.18.2.
+#
+# For each new release:
+#   1. Re-cherry-pick the 4 PRs in order (handles merge conflicts per release)
+#   2. Skip any that are no-ops against the new base
+#   3. Do NOT add them to this manifest — the script doesn't know which
+#      ones to skip
+# Canonical SHAs from jasnoor/v0.15.2-jasnoor-working-code:
+#   4069c3a464acf9cc05ed532f332a5d79211085f9  detect ADTS AAC voice notes
+#   b8a28da53b50686fdbe38c6f4cf73153f0fccf1b  route non-media attachments
+#   eec7ae8f0749c46a4a787596b2f411ffd366291e  rescue text attachments from .bin
+#   7d60da764f731009eb2ec526a2fa4a7ef23560b1  full Telegram-pattern parity
