@@ -34,12 +34,15 @@ Safety posture:
 from __future__ import annotations
 
 import json
+import logging
 import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -180,13 +183,38 @@ def _iter_terminal_calls(
                 fn = call.get("function") or {}
                 if fn.get("name") != "terminal":
                     continue
-                try:
-                    args = json.loads(fn.get("arguments") or "{}")
-                except (TypeError, ValueError):
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, dict):
+                    # Some tool-call shapes carry parsed args, not a JSON string.
+                    args = raw_args
+                elif isinstance(raw_args, (list, tuple)):
+                    # argv-shaped JSON (["rm", "-rf", ...]) already decoded by
+                    # the outer json.loads(calls); handle as a non-dict below.
+                    args = list(raw_args)
+                elif raw_args is None or raw_args == "":
+                    args = {}
+                elif isinstance(raw_args, str):
+                    try:
+                        args = json.loads(raw_args)
+                    except (TypeError, ValueError):
+                        continue
+                else:
+                    # Unknown shape (scalar, etc.) — skip with a log.
+                    logger.debug(
+                        "approvals_suggest: skipping terminal call %s — "
+                        "arguments is %s, expected dict",
+                        call.get("id") or "<no-id>", type(raw_args).__name__,
+                    )
                     continue
                 if not isinstance(args, dict):
-                    # arguments field can parse as a list or scalar for some
-                    # tool-call shapes; nothing to mine in that case.
+                    # arguments parsed as a list/scalar (e.g. argv-shaped JSON);
+                    # nothing to mine, but log so unexpected tool-call shapes
+                    # aren't silently dropped from the approval history.
+                    logger.debug(
+                        "approvals_suggest: skipping terminal call %s — "
+                        "arguments is %s, expected dict",
+                        call.get("id") or "<no-id>", type(args).__name__,
+                    )
                     continue
                 command = args.get("command")
                 if isinstance(command, str) and command.strip():
