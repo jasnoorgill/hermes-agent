@@ -87,6 +87,35 @@ def _add_terminal_call(con, command, result="ok: done", ts=None):
     con.commit()
 
 
+def _add_terminal_call_raw_args(con, function_args, ts=None):
+    """Insert a terminal tool call whose ``function.arguments`` is given
+    verbatim — supports both JSON-string and already-parsed dict/list shapes
+    to exercise the _iter_terminal_calls arg-parsing branches."""
+    _ID_COUNTER[0] += 1
+    call_id = f"call_raw_{_ID_COUNTER[0]}"
+    ts = ts if ts is not None else time.time()
+    tool_calls = json.dumps(
+        [
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "terminal", "arguments": function_args},
+            }
+        ]
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) "
+        "VALUES ('s1', 'assistant', '', ?, ?)",
+        (tool_calls, ts),
+    )
+    con.execute(
+        "INSERT INTO messages (session_id, role, content, tool_call_id, timestamp) "
+        "VALUES ('s1', 'tool', 'ok', ?, ?)",
+        (call_id, ts + 1),
+    )
+    con.commit()
+
+
 @pytest.fixture
 def db_path(tmp_path):
     path = tmp_path / "state.db"
@@ -294,3 +323,78 @@ class TestParserWiring:
         assert args.json is False
         assert args.days == 90
         assert args.min_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Guard regression tests: list-typed and already-dict args in tool calls
+# ---------------------------------------------------------------------------
+
+class TestIterTerminalCallsArgShapes:
+    """Regression for fix/approvals-suggest-list-args.
+
+    ``_iter_terminal_calls`` must tolerate three ``function.arguments`` shapes:
+      1. JSON string of an object (the canonical case)         -> mined.
+      2. Already-parsed dict (some tool-call emitters)         -> mined.
+      3. JSON list, e.g. argv-shaped ``["rm", "-rf", ...]``   -> skipped + logged.
+    Cases 2 and 3 would previously raise ``TypeError`` / be silently dropped.
+    """
+
+    def _commands(self, con):
+        """Run scan_approval_history on ``con``'s db via a fresh connection."""
+        path = con.execute("PRAGMA database_list").fetchone()[2]
+        con.close()
+        records = scan_approval_history(path, days=0)
+        return [c for c, _ in records]
+
+    def test_canonical_json_string_args_still_mined(self, db_path):
+        path, con = db_path
+        _add_terminal_call(con, "git push --force origin main")
+        assert self._commands(con) == ["git push --force origin main"]
+
+    def test_already_parsed_dict_args_are_mined(self, db_path, caplog):
+        """arguments already a dict (not a JSON string) must be accepted."""
+        path, con = db_path
+        _add_terminal_call_raw_args(con, {"command": "docker restart web"})
+        records = scan_approval_history(path, days=0)
+        commands = [c for c, _ in records]
+        assert commands == ["docker restart web"]
+
+    def test_empty_arguments_field_treated_as_empty_dict(self, db_path):
+        """Missing/empty arguments must not raise and must produce zero hits."""
+        path, con = db_path
+        _add_terminal_call_raw_args(con, "")
+        # Second call: actual command for sanity-check that the loop continues.
+        _add_terminal_call(con, "docker compose restart web")
+        commands = self._commands(con)
+        assert commands == ["docker compose restart web"]
+
+    def test_list_typed_args_are_skipped_with_debug_log(self, db_path, caplog):
+        """argv-shaped list arguments must be skipped, not raise, not silently
+        swallowed: a debug line must be emitted so the shape is observable."""
+        path, con = db_path
+        _add_terminal_call_raw_args(con, ["rm", "-rf", "/tmp/foo"])
+        import logging as _logging
+
+        with caplog.at_level(_logging.DEBUG, logger="hermes_cli.approvals_suggest"):
+            commands = self._commands(con)
+        assert commands == []
+        skipped_logs = [
+            r for r in caplog.records
+            if r.name == "hermes_cli.approvals_suggest"
+            and "arguments is list" in r.getMessage()
+        ]
+        assert skipped_logs, f"expected a debug skip-log, got: {[r.getMessage() for r in caplog.records]}"
+
+    def test_mixed_shapes_only_mine_the_minable_ones(self, db_path):
+        """A scan over mixed arg shapes must mine the mineable calls and
+        silently drop the un-mineable ones without crashing."""
+        path, con = db_path
+        _add_terminal_call(con, "git push --force origin main")            # canonical
+        _add_terminal_call_raw_args(con, {"command": "docker restart web"})  # dict
+        _add_terminal_call_raw_args(con, ["rm", "-rf", "/"])               # list, skipped
+        _add_terminal_call_raw_args(con, "not-json{{{")                   # junk JSON, skipped
+        _add_terminal_call_raw_args(con, "null")                          # parses to None, skipped
+        commands = sorted(self._commands(con))
+        assert commands == sorted(
+            ["git push --force origin main", "docker restart web"]
+        )
