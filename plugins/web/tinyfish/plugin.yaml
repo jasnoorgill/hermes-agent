@@ -1,0 +1,7 @@
+name: web-tinyfish
+version: 1.0.0
+description: "TinyFish AI Web Search + Fetch — free-tier aware. Provides search and extract via api.search.tinyfish.ai and api.fetch.tinyfish.ai. Requires TINYFISH_API_KEY from agent.tinyfish.ai/api-keys. Free tier: 30 req/min search, 150 URLs/min fetch (locally capped to 28/140 for safety)."
+author: Jasnoor Gill
+kind: backend
+provides_web_providers:
+  - tinyfish
