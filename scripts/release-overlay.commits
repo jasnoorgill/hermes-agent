@@ -12,12 +12,28 @@
 #   3. Resolve any conflicts interactively. Re-run after fixing.
 #   4. Push: git push fork release/v2026.8.15 jasnoor/v2026.8.15-custom
 #
-# --- TinyFish web backend (June 2026) ---
-# Plugin + registry wiring + schema-gate allowlist. NOT yet on any upstream
-# release tag — these are our unique value-add.
-8bea9fc6be19c1de928d78d67fea06a25aa1872a
-4ccd63edf5eb9bc094e90ea41cd91f6fc2b24919
-86a1f914d50490c3b1aa98c5820e821c067d9b87
+# --- TinyFish web backend ---
+# Plugin + registry wiring. v2026.9.7's plugin-discovery model absorbs the
+# old "register in legacy allowlist" and "add to schema gate" hardcodes —
+# just one commit is needed now (the plugin files themselves), because
+# _is_backend_available() / check_web_api_key() auto-route through the
+# registry. NOT yet on any upstream release tag — this is our unique
+# value-add.
+3551c87986
+
+# --- TinyFish web backend (legacy 3-commit stack, kept for history) ---
+# These were the canonical 3 commits on jasnoor/v2026.8.19-custom:
+#   feat(web): add tinyfish search+fetch plugin with burst-drain free-tier throttling
+#   fix(web): register tinyfish plugin and add to legacy backend allowlist
+#   fix(web): add tinyfish to schema gate allowlist and availability probe
+# All three are obsolete against v2026.9.7+ — the registry pattern absorbed
+# the second and third, and the first was superseded by 3551c87986 (clean
+# port onto BaseWebSearchProvider). DO NOT uncomment: re-adding them
+# conflicts with the registry-driven design (see release-overlay gotcha:
+# "Conflict pattern when upstream refactored a function you patched").
+# 71ccbe3d03
+# 2866a26851
+# a449637f3f
 
 # --- Signal attachment handling ---
 # These were the canonical fixes as of July 2026. They are EQUIVALENT to the
