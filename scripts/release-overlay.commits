@@ -21,6 +21,11 @@
 # value-add.
 3551c87986
 
+# --- Release-overlay automation docs ---
+# scripts/release-overlay.{sh,commits,md} — the overlay workflow itself.
+# Layered on so the pattern reproduces for future release tags.
+f51155aac9
+
 # --- TinyFish web backend (legacy 3-commit stack, kept for history) ---
 # These were the canonical 3 commits on jasnoor/v2026.8.19-custom:
 #   feat(web): add tinyfish search+fetch plugin with burst-drain free-tier throttling
